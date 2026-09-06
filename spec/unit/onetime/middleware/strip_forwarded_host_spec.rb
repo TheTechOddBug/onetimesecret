@@ -9,19 +9,16 @@ require 'onetime/middleware/strip_forwarded_host'
 #
 # The middleware's contract has two halves and both are security-relevant:
 #
-#   1. No forwarded AUTHORITY survives. `X-Forwarded-Host` is deleted
-#      outright, and every `host=` parameter is removed from the RFC 7239
-#      `Forwarded` header, so `Rack::Request#host` (which honors both from
-#      ANY client, ungated by proxy trust) can only ever resolve the `Host:`
-#      authority the edge actually received.
+#   1. No forwarded AUTHORITY survives. `X-Forwarded-Host` and the RFC 7239
+#      `Forwarded` header are deleted outright — no parsing, so no quoting
+#      trick can smuggle a `host=` past the strip — and `Rack::Request#host`
+#      can only ever resolve the `Host:` authority the edge received.
 #
-#   2. The OTHER RFC 7239 parameters survive. `Forwarded` multiplexes host
-#      with `proto`/`for`/`by`, and Rack reads those too (`Request#scheme`
-#      via forwarded_scheme, `#forwarded_for`, `#forwarded_port`). A proxy
-#      that speaks only `Forwarded` — no `X-Forwarded-Proto` — must not lose
-#      its TLS scheme here, or every absolute URL built downstream degrades
-#      to http. Deleting the whole header was the original (reviewed-out)
-#      behavior; these examples pin the surgical one.
+#   2. The scheme Rack resolved from `Forwarded` (under the process-wide
+#      forwarded_priority otto 2.10 pins) survives in `rack.url_scheme`, the
+#      key `Rack::Request#scheme` falls back to once no forwarded carrier is
+#      present. A depth-mode `Forwarded`-only proxy keeps its TLS scheme;
+#      the X-Forwarded-* family is untouched and resolves on its own.
 RSpec.describe Onetime::Middleware::StripForwardedHost do
   subject(:middleware) { described_class.new(app) }
 
@@ -30,6 +27,16 @@ RSpec.describe Onetime::Middleware::StripForwardedHost do
   def call_with(env)
     middleware.call(env)
     @seen_env
+  end
+
+  # Rack's forwarded_priority is process-global class state that otto 2.10
+  # pins per process (spec_helper resets it after every example). Each
+  # example sets the priority it is asserting against.
+  around do |example|
+    original = Rack::Request.forwarded_priority
+    example.run
+  ensure
+    Rack::Request.forwarded_priority = original
   end
 
   describe 'X-Forwarded-Host' do
@@ -41,63 +48,33 @@ RSpec.describe Onetime::Middleware::StripForwardedHost do
   end
 
   describe 'RFC 7239 Forwarded' do
-    it 'removes a lone host parameter and deletes the emptied header' do
-      env = call_with('HTTP_FORWARDED' => 'host=evil.example.com')
+    it 'deletes the header unconditionally' do
+      env = call_with(Rack::MockRequest.env_for('http://onetime.test/', 'HTTP_FORWARDED' => 'for=192.0.2.60;proto=https;host=evil.example.com'))
       expect(env).not_to have_key('HTTP_FORWARDED')
     end
 
-    it 'preserves proto and for while removing host (case-insensitively)' do
-      env = call_with('HTTP_FORWARDED' => 'for=192.0.2.60;proto=https;Host=evil.example.com')
-      expect(env['HTTP_FORWARDED']).to eq('for=192.0.2.60;proto=https')
+    it 'deletes a header built to survive a quote-unaware host edit' do
+      # A parser that disagrees with Rack's on quoting could keep this host=.
+      # Whole-header delete has no parser to disagree with.
+      Rack::Request.forwarded_priority = [:forwarded, :x_forwarded]
+
+      env = call_with(Rack::MockRequest.env_for('http://onetime.test/', 'HTTP_FORWARDED' => 'for=a"b;host=evil.example.com'))
+      aggregate_failures do
+        expect(env).not_to have_key('HTTP_FORWARDED')
+        expect(Rack::Request.new(env).host).to eq('onetime.test')
+      end
     end
 
-    it 'keeps a host-free header completely intact' do
-      env = call_with('HTTP_FORWARDED' => 'for=192.0.2.60;proto=https')
-      expect(env['HTTP_FORWARDED']).to eq('for=192.0.2.60;proto=https')
-    end
-
-    it 'removes host from every element of a multi-hop header' do
-      env = call_with(
-        'HTTP_FORWARDED' => 'for=192.0.2.60;host=evil.example.com, for=198.51.100.1;proto=https;host=evil2.example.com',
-      )
-      expect(env['HTTP_FORWARDED']).to eq('for=192.0.2.60, for=198.51.100.1;proto=https')
-    end
-
-    it 'drops an element made empty and keeps the others' do
-      env = call_with('HTTP_FORWARDED' => 'host=evil.example.com, for=198.51.100.1')
-      expect(env['HTTP_FORWARDED']).to eq('for=198.51.100.1')
-    end
-
-    it 'removes a quoted host value containing a separator without breaking the element' do
-      env = call_with('HTTP_FORWARDED' => 'host="evil;example,com";for=192.0.2.60')
-      expect(env['HTTP_FORWARDED']).to eq('for=192.0.2.60')
-    end
-
-    it 'does not split a quoted non-host value on embedded separators' do
-      env = call_with('HTTP_FORWARDED' => 'for="[2001:db8:cafe::17]:4711";host=evil.example.com')
-      expect(env['HTTP_FORWARDED']).to eq('for="[2001:db8:cafe::17]:4711"')
-    end
-
-    it 'leaves the env untouched when no Forwarded header is present' do
-      env = call_with('HTTP_HOST' => 'onetime.test')
-      expect(env).not_to have_key('HTTP_FORWARDED')
-      expect(env['HTTP_HOST']).to eq('onetime.test')
+    it 'leaves the env untouched when no forwarded header is present' do
+      env = call_with('HTTP_HOST' => 'onetime.test', 'rack.url_scheme' => 'http')
+      aggregate_failures do
+        expect(env).not_to have_key('HTTP_FORWARDED')
+        expect(env['rack.url_scheme']).to eq('http')
+      end
     end
   end
 
-  # Rack's forwarded_priority is process-global class state. otto 2.10 pins
-  # it to [:x_forwarded] whenever MiddlewareStack.ip_privacy_security_config
-  # (or any bare Otto.new) has run in this process, so whether Rack reads the
-  # surviving Forwarded `proto` depends on spec ordering. Each example sets
-  # the priority it is asserting against.
   describe 'post-strip Rack resolution' do
-    around do |example|
-      original = Rack::Request.forwarded_priority
-      example.run
-    ensure
-      Rack::Request.forwarded_priority = original
-    end
-
     let(:env) do
       Rack::MockRequest.env_for(
         'http://onetime.test/',
@@ -111,16 +88,32 @@ RSpec.describe Onetime::Middleware::StripForwardedHost do
       expect(Rack::Request.new(call_with(env)).host).to eq('onetime.test')
     end
 
-    it 'leaves the surviving Forwarded proto readable under the Rack default priority' do
-      # The surgical strip exists so env-level readers (Otto's depth-mode
-      # Forwarded IP resolution, the redacted fingerprint) and any process
-      # running Rack's default priority still see proto/for.
-      Rack::Request.forwarded_priority = [:forwarded, :x_forwarded]
+    it 'carries the Forwarded proto into rack.url_scheme when the pinned family reads Forwarded (depth mode)' do
+      Rack::Request.forwarded_priority = [:forwarded]
+
+      request = Rack::Request.new(call_with(env))
+      aggregate_failures do
+        expect(request.env['rack.url_scheme']).to eq('https')
+        expect(request.scheme).to eq('https')
+      end
+    end
+
+    it 'does not honor the Forwarded proto when the pinned family is X-Forwarded-* (default)' do
+      Rack::Request.forwarded_priority = [:x_forwarded]
+      expect(Rack::Request.new(call_with(env)).scheme).to eq('http')
+    end
+
+    it 'still resolves scheme from the untouched X-Forwarded-Proto under the default family' do
+      Rack::Request.forwarded_priority = [:x_forwarded]
+
+      env['HTTP_X_FORWARDED_PROTO'] = 'https'
       expect(Rack::Request.new(call_with(env)).scheme).to eq('https')
     end
 
-    it 'does not read the surviving Forwarded proto once otto pins the priority to X-Forwarded-*' do
-      Rack::Request.forwarded_priority = [:x_forwarded]
+    it 'does not upgrade a plain http request that carries only a Forwarded host' do
+      Rack::Request.forwarded_priority = [:forwarded]
+
+      env['HTTP_FORWARDED'] = 'host=evil.example.com'
       expect(Rack::Request.new(call_with(env)).scheme).to eq('http')
     end
   end

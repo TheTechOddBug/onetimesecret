@@ -25,5 +25,12 @@ Changed
   dropped, the scheme falls back to the socket, and secure cookies are not
   written. Add the proxy's range to ``cidrs`` (or use depth mode).
 
+- The forwarded-host stripping middleware now deletes the RFC 7239
+  ``Forwarded`` header outright instead of editing its ``host=`` parameters
+  out, so no quoting trick can smuggle a host past the strip. The scheme Rack
+  resolved from the header under the pinned forwarding family is carried into
+  ``rack.url_scheme`` first, so a depth-mode ``Forwarded``-only proxy keeps
+  its TLS scheme.
+
 - ``rack-parser`` is declared directly in the Gemfile; it stopped being an
   otto runtime dependency in 2.10.
