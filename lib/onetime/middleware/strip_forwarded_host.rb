@@ -25,29 +25,72 @@ module Onetime
     # authority the edge actually received — never a client-supplied one —
     # regardless of the operator's proxy configuration.
     #
-    # ## Host only — the other RFC 7239 parameters survive
+    # ## Relationship to otto 2.10
     #
-    # `X-Forwarded-Host` carries nothing but an authority, so it is deleted
-    # outright. The RFC 7239 `Forwarded` header, however, multiplexes host
-    # alongside `proto`, `for`, and `by` — and Rack reads those too
-    # (`Request#scheme` via `forwarded_scheme`, `#forwarded_for`,
-    # `#forwarded_port`). A deployment whose proxy speaks only `Forwarded`
-    # (no `X-Forwarded-Proto`) would lose its TLS scheme — and every absolute
-    # URL built after this middleware — if the whole header vanished. So for
-    # `Forwarded` we surgically remove the `host=` parameters and keep the
-    # rest; the header is deleted only when nothing else remains. With no
-    # `host=` present, Rack's `forwarded_authority` finds nothing at the
-    # `:forwarded` priority and falls through to `X-Forwarded-Host` — which
-    # this middleware has already deleted.
+    # otto 2.10 pins `Rack::Request.forwarded_priority` to the family chosen
+    # in MiddlewareStack.ip_privacy_security_config ([:x_forwarded] unless
+    # depth mode names `Forwarded`), and its IPPrivacyMiddleware deletes every
+    # forwarded authority carrier from an untrusted peer once proxy trust is
+    # configured. This middleware still runs unconditionally: otto strips
+    # nothing while trust is unconfigured (the default deployment), and keeps
+    # a trusted peer's carriers because it cannot tell a value the proxy set
+    # from one the proxy passed through. Both headers are deleted here, so the
+    # host authority that reaches every later reader is `Host:` alone.
     #
-    # Since Onetime::Initializers::ConfigureRack pins
-    # `Rack::Request.forwarded_priority = [:x_forwarded]`, Rack no longer
-    # consults `Forwarded` for ANY of host/for/port/proto, so the surgical
-    # preservation above is moot for Rack itself. It is kept because other
-    # readers still consume the raw header from the env — Otto's IP privacy
-    # middleware in depth mode with `trusted_proxy.header: Forwarded`, and
-    # its redacted fingerprint — and because the priority is process-global
-    # state a future require could reset; the env-level strip holds either way.
+    # ## Whole-header delete, scheme handed to `rack.url_scheme`
+    #
+    # `Forwarded` multiplexes host with `proto`/`for`/`by`. An earlier version
+    # of this middleware edited only the `host=` parameters out so a
+    # `Forwarded`-only proxy kept its TLS scheme. That needs a second RFC 7239
+    # parser, and a parser that disagrees with Rack's on quoting lets a
+    # `host=` survive the edit (`for=a"b;host=evil` is enough). Deletion has
+    # no such failure mode. The one thing Rack legitimately read from the
+    # header — the scheme, under the pinned family — is resolved by Rack
+    # itself BEFORE the delete and written to `rack.url_scheme`, the key
+    # `Rack::Request#scheme` falls back to once no forwarded carrier is
+    # present. No parsing happens here; Rack's answer before the strip is
+    # Rack's answer after it. `X-Forwarded-Proto` and `X-Forwarded-SSL` are
+    # not touched, so the X-Forwarded-* family continues to resolve on its
+    # own; `for=` has already been consumed by otto's IP resolution, which
+    # runs first.
+    #
+    # ## The write is UPGRADE-ONLY
+    #
+    # `Rack::Request#scheme` consults a forwarded carrier BEFORE it falls back
+    # to `rack.url_scheme`, so under a `[:forwarded]` pin the pre-strip read
+    # can answer `http` for a request that is already established as https.
+    # Persisting that would be a permanent downgrade: the header is gone a
+    # line later, so the https that `rack.url_scheme` still held is not
+    # recoverable, and every later secure-cookie / HSTS / origin / URL
+    # consumer sees a plaintext request.
+    #
+    # Two ways an established https reaches here with a `Forwarded: proto=http`
+    # attached:
+    #
+    #   - TLS terminated at the ORIGIN. The Rack server sets
+    #     `rack.url_scheme = 'https'` and no `HTTPS` env var, so nothing
+    #     outranks the forwarded carrier in `#scheme`.
+    #   - Onetime::Middleware::AssumeHttps, which sets `env['HTTPS'] = 'on'`
+    #     alongside the scheme. `#scheme` checks HTTPS first, so this case
+    #     already read back as https — but it should not depend on which of
+    #     the two keys an upstream happened to set.
+    #
+    # So the write only ever raises the scheme, mirroring AssumeHttps's own
+    # upgrade-only invariant. Downgrading is exactly what a forwarded value is
+    # untrusted for; the `Forwarded`-only proxy this write exists to serve is
+    # upgrading http to https, which still works.
+    #
+    # ## What was deleted is recorded by NAME
+    #
+    # Two readers mounted below this middleware diagnose the edge's forwarding
+    # topology from the PRESENCE of these carriers: Onetime::Session's
+    # dropped-secure-cookie warning (its `forwarded:` field exists to spot the
+    # "edge speaks only `Forwarded`" deployment) and the colonel
+    # `/system/proxy-headers` report. Deleting the headers would leave both
+    # permanently reporting "absent". So the names of the carriers deleted
+    # here are left in `env['onetime.stripped_forwarded_headers']` — names
+    # only, never values: `Forwarded` carries the client IP in `for=`, which
+    # is exactly what the session warning keeps out of the log.
     #
     # ## Ordering — AFTER DetectHost AND AdminNetworkIsolation, before
     # ## anything reads request.host
@@ -77,86 +120,47 @@ module Onetime
       # Carries only an authority: deleted outright.
       X_FORWARDED_HOST = 'HTTP_X_FORWARDED_HOST'
 
-      # RFC 7239 — multiplexes host with proto/for/by: host params are
-      # removed, the rest is preserved.
+      # RFC 7239 — multiplexes host with proto/for/by: deleted outright, the
+      # scheme Rack resolved from it is carried in rack.url_scheme.
       FORWARDED = 'HTTP_FORWARDED'
+
+      # Rack's fallback scheme key (Rack::RACK_URL_SCHEME).
+      RACK_URL_SCHEME = 'rack.url_scheme'
+
+      HTTPS_SCHEME = 'https'
+
+      # Names (env keys) of the carriers this middleware deleted from the
+      # request, for the presence-only diagnostics below it. Set only when
+      # something was deleted; absent otherwise. See "What was deleted is
+      # recorded by NAME" above.
+      STRIPPED_HEADERS = 'onetime.stripped_forwarded_headers'
+
+      STRIPPED_CANDIDATES = [X_FORWARDED_HOST, FORWARDED].freeze
 
       def initialize(app)
         @app = app
       end
 
       def call(env)
-        env.delete(X_FORWARDED_HOST)
+        stripped = STRIPPED_CANDIDATES.select { |key| env.key?(key) }
 
-        if (raw = env[FORWARDED])
-          stripped = self.class.without_host_params(raw)
-          if stripped.nil?
-            env.delete(FORWARDED)
-          else
-            env[FORWARDED] = stripped
-          end
-        end
+        carry_forwarded_scheme(env) if stripped.include?(FORWARDED)
+
+        stripped.each { |key| env.delete(key) }
+        env[STRIPPED_HEADERS] = stripped.freeze unless stripped.empty?
 
         @app.call(env)
       end
 
-      # Rebuild an RFC 7239 `Forwarded` value with every `host=` parameter
-      # removed, preserving the element (comma) and parameter (semicolon)
-      # structure — and therefore the per-hop association of the surviving
-      # `proto`/`for`/`by` parameters. Splits are quote-aware: a
-      # quoted-string value (with backslash escapes) may contain `,` or `;`
-      # without ending the element or parameter, matching how
-      # Rack::Utils.forwarded_values tokenizes the header.
-      #
-      # @param raw [String] the incoming Forwarded header value
-      # @return [String, nil] the value without host params, or nil when no
-      #   parameter survives (caller deletes the header)
-      def self.without_host_params(raw)
-        kept_elements = split_unquoted(raw, ',').filter_map do |element|
-          kept = split_unquoted(element, ';').map(&:strip).reject do |pair|
-            pair.empty? || pair.split('=', 2).first.to_s.strip.downcase == 'host'
-          end
-          kept.join(';') unless kept.empty?
-        end
+      private
 
-        kept_elements.empty? ? nil : kept_elements.join(', ')
-      end
+      # Persist the scheme Rack resolves while `Forwarded` is still present,
+      # but never below the one already established. See "The write is
+      # UPGRADE-ONLY" above.
+      def carry_forwarded_scheme(env)
+        return if env[RACK_URL_SCHEME] == HTTPS_SCHEME || env['HTTPS'] == 'on'
 
-      # Split +value+ on +separator+, ignoring separators inside RFC 7230
-      # quoted-strings (backslash escapes honored).
-      #
-      # @param value [String]
-      # @param separator [String] a single character
-      # @return [Array<String>]
-      def self.split_unquoted(value, separator)
-        parts     = []
-        current   = +''
-        in_quotes = false
-        escaped   = false
-
-        value.each_char do |char|
-          if in_quotes
-            current << char
-            if escaped
-              escaped = false
-            elsif char == '\\'
-              escaped = true
-            elsif char == '"'
-              in_quotes = false
-            end
-          elsif char == '"'
-            in_quotes = true
-            current << char
-          elsif char == separator
-            parts << current
-            current = +''
-          else
-            current << char
-          end
-        end
-
-        parts << current
-        parts
+        env[RACK_URL_SCHEME] = Rack::Request.new(env).scheme
       end
     end
   end

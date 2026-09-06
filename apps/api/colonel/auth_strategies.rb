@@ -30,8 +30,13 @@ module ColonelAPI
         HTTP_X_OTS_PROXY_DEBUG_RECEIVED_APX_INCOMING_HOST
       ].freeze
 
-      # Forwarding headers as Rack received them, for comparison against
-      # PROXY_DEBUG_HEADERS and the resolved env values.
+      # Forwarding headers as this strategy sees them, for comparison against
+      # PROXY_DEBUG_HEADERS and the resolved env values. Two of these —
+      # X-Forwarded-Host and Forwarded — are deleted by
+      # Onetime::Middleware::StripForwardedHost before any app runs, so they
+      # read nil here whenever the edge sent them; the middleware records the
+      # names it deleted in STRIPPED_FORWARDED_HEADERS, reported alongside so
+      # "nil because absent" and "nil because stripped" stay distinguishable.
       FORWARDING_HEADERS = %w[
         HTTP_HOST
         HTTP_X_FORWARDED_FOR
@@ -42,6 +47,11 @@ module ColonelAPI
         HTTP_FORWARDED
         HTTP_APX_INCOMING_HOST
       ].freeze
+
+      # Env key StripForwardedHost leaves the names of the carriers it deleted
+      # in (names only, never values). Literal rather than the middleware's
+      # constant so this strategy does not load the middleware.
+      STRIPPED_FORWARDED_HEADERS = 'onetime.stripped_forwarded_headers'
 
       # Destructive-action confirmation token (#4326). Carried as a REQUEST HEADER,
       # never a query parameter: the tokens are frequently PII (a target's email,
@@ -89,6 +99,7 @@ module ColonelAPI
               client_ip: env['otto.client_ip'],
               via_trusted_proxy: env['otto.via_trusted_proxy'],
               detected_host: env[Rack::DetectHost.result_field_name],
+              stripped_forwarded_headers: header_names(env[STRIPPED_FORWARDED_HEADERS]),
             },
             request_headers: header_values(env, FORWARDING_HEADERS),
           },
@@ -97,8 +108,17 @@ module ColonelAPI
 
       def header_values(env, keys)
         keys.to_h do |key|
-          [key.delete_prefix('HTTP_').tr('_', '-').downcase, env[key]]
+          [header_name(key), env[key]]
         end
+      end
+
+      def header_names(keys)
+        Array(keys).map { |key| header_name(key) }
+      end
+
+      # Rack env key -> wire header name: HTTP_X_FORWARDED_FOR -> x-forwarded-for
+      def header_name(key)
+        key.delete_prefix('HTTP_').tr('_', '-').downcase
       end
 
       # Percent-decoded so a non-ASCII token (org display names) survives the

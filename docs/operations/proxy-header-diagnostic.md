@@ -146,6 +146,10 @@ refused the request.
    resolves and rewrites `REMOTE_ADDR` before the authentication strategy runs.
 4. Check `rack.via_trusted_proxy`, `rack.client_ip`, and
    `rack.detected_host` to see the application's resulting trust decision.
+5. `request_headers.forwarded` and `request_headers.x-forwarded-host` are
+   always empty: the application deletes both headers before any route runs.
+   `rack.stripped_forwarded_headers` lists the ones it deleted (names only),
+   so an empty entry there means the edge never sent the header.
 
 The endpoint reports observations; it does not prove an upstream header is
 trustworthy. A client can still choose any marker header. The result establishes

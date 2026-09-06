@@ -581,8 +581,8 @@ site:
     # - Each proxy appends its own IP to the forwarding header
     #
     trusted_proxy:
-      # Turns proxy-aware IP resolution on. The mode, cidrs, and depth
-      # settings below do nothing while this is false.
+      # Turns proxy-aware IP resolution on. The mode, header, cidrs, and
+      # depth settings below do nothing while this is false.
       #
       # When false, forwarded headers are ignored and the client IP is
       # REMOTE_ADDR — the address that opened the connection. That is right
@@ -604,9 +604,9 @@ site:
       #   the client IP. The trusted set is the RFC1918/loopback/link-local
       #   private ranges (always trusted in this mode) plus every range in
       #   `cidrs` below. Works for most k8s/cloud deployments where the proxy
-      #   tier has enumerable internal addresses. Note: filter mode ignores
-      #   `header` below and reads the X-Forwarded-For family (X-Forwarded-For,
-      #   X-Real-IP, X-Client-IP).
+      #   tier has enumerable internal addresses. Note: filter mode reads the
+      #   X-Forwarded-For family only (X-Forwarded-For, X-Real-IP, X-Client-IP)
+      #   and REJECTS any other `header` value below at boot.
       #
       #   SECURITY — read before enabling: the edge proxy MUST OVERWRITE
       #   X-Forwarded-For with the real peer address so the resolved client IP
@@ -655,8 +655,11 @@ site:
       # hops to count. (Vendor GEO headers such as CF-IPCountry are a separate
       # concern with its own resolution path; this setting does not affect
       # them.) If the edge only sets one of those, have it write the chain
-      # into X-Forwarded-For. Filter mode ignores this setting and reads the
-      # X-Forwarded-For family (X-Forwarded-For, X-Real-IP, X-Client-IP).
+      # into X-Forwarded-For. Filter mode reads the X-Forwarded-For family
+      # only (X-Forwarded-For, X-Real-IP, X-Client-IP) and never RFC 7239
+      # Forwarded: with `mode: filter`, any value here other than
+      # X-Forwarded-For FAILS THE BOOT with a message naming both keys.
+      # Leave it at the default (or unset) unless mode is depth.
       header: <%= ENV['TRUSTED_PROXY_HEADER'] || 'X-Forwarded-For' %>
 
       # Filter mode only: Additional CIDR ranges to trust as proxies
