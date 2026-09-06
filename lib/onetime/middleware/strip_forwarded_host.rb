@@ -54,13 +54,43 @@ module Onetime
     # own; `for=` has already been consumed by otto's IP resolution, which
     # runs first.
     #
-    # This write cannot DOWNGRADE a scheme an upstream middleware upgraded.
-    # `Rack::Request#scheme` answers from `env['HTTPS'] == 'on'` before it
-    # looks at any forwarded carrier, and Onetime::Middleware::AssumeHttps
-    # (mounted far above) sets HTTPS alongside rack.url_scheme. So under
-    # assume_https a client-supplied `Forwarded: proto=http` still reads back
-    # as https here, and the secure-cookie / origin / HSTS consumers keep the
-    # operator's policy. Pinned in the middleware spec.
+    # ## The write is UPGRADE-ONLY
+    #
+    # `Rack::Request#scheme` consults a forwarded carrier BEFORE it falls back
+    # to `rack.url_scheme`, so under a `[:forwarded]` pin the pre-strip read
+    # can answer `http` for a request that is already established as https.
+    # Persisting that would be a permanent downgrade: the header is gone a
+    # line later, so the https that `rack.url_scheme` still held is not
+    # recoverable, and every later secure-cookie / HSTS / origin / URL
+    # consumer sees a plaintext request.
+    #
+    # Two ways an established https reaches here with a `Forwarded: proto=http`
+    # attached:
+    #
+    #   - TLS terminated at the ORIGIN. The Rack server sets
+    #     `rack.url_scheme = 'https'` and no `HTTPS` env var, so nothing
+    #     outranks the forwarded carrier in `#scheme`.
+    #   - Onetime::Middleware::AssumeHttps, which sets `env['HTTPS'] = 'on'`
+    #     alongside the scheme. `#scheme` checks HTTPS first, so this case
+    #     already read back as https — but it should not depend on which of
+    #     the two keys an upstream happened to set.
+    #
+    # So the write only ever raises the scheme, mirroring AssumeHttps's own
+    # upgrade-only invariant. Downgrading is exactly what a forwarded value is
+    # untrusted for; the `Forwarded`-only proxy this write exists to serve is
+    # upgrading http to https, which still works.
+    #
+    # ## What was deleted is recorded by NAME
+    #
+    # Two readers mounted below this middleware diagnose the edge's forwarding
+    # topology from the PRESENCE of these carriers: Onetime::Session's
+    # dropped-secure-cookie warning (its `forwarded:` field exists to spot the
+    # "edge speaks only `Forwarded`" deployment) and the colonel
+    # `/system/proxy-headers` report. Deleting the headers would leave both
+    # permanently reporting "absent". So the names of the carriers deleted
+    # here are left in `env['onetime.stripped_forwarded_headers']` — names
+    # only, never values: `Forwarded` carries the client IP in `for=`, which
+    # is exactly what the session warning keeps out of the log.
     #
     # ## Ordering — AFTER DetectHost AND AdminNetworkIsolation, before
     # ## anything reads request.host
@@ -97,17 +127,40 @@ module Onetime
       # Rack's fallback scheme key (Rack::RACK_URL_SCHEME).
       RACK_URL_SCHEME = 'rack.url_scheme'
 
+      HTTPS_SCHEME = 'https'
+
+      # Names (env keys) of the carriers this middleware deleted from the
+      # request, for the presence-only diagnostics below it. Set only when
+      # something was deleted; absent otherwise. See "What was deleted is
+      # recorded by NAME" above.
+      STRIPPED_HEADERS = 'onetime.stripped_forwarded_headers'
+
+      STRIPPED_CANDIDATES = [X_FORWARDED_HOST, FORWARDED].freeze
+
       def initialize(app)
         @app = app
       end
 
       def call(env)
-        env[RACK_URL_SCHEME] = Rack::Request.new(env).scheme if env.key?(FORWARDED)
+        stripped = STRIPPED_CANDIDATES.select { |key| env.key?(key) }
 
-        env.delete(X_FORWARDED_HOST)
-        env.delete(FORWARDED)
+        carry_forwarded_scheme(env) if stripped.include?(FORWARDED)
+
+        stripped.each { |key| env.delete(key) }
+        env[STRIPPED_HEADERS] = stripped.freeze unless stripped.empty?
 
         @app.call(env)
+      end
+
+      private
+
+      # Persist the scheme Rack resolves while `Forwarded` is still present,
+      # but never below the one already established. See "The write is
+      # UPGRADE-ONLY" above.
+      def carry_forwarded_scheme(env)
+        return if env[RACK_URL_SCHEME] == HTTPS_SCHEME || env['HTTPS'] == 'on'
+
+        env[RACK_URL_SCHEME] = Rack::Request.new(env).scheme
       end
     end
   end

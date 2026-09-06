@@ -70,7 +70,31 @@ RSpec.describe Onetime::Middleware::StripForwardedHost do
       aggregate_failures do
         expect(env).not_to have_key('HTTP_FORWARDED')
         expect(env['rack.url_scheme']).to eq('http')
+        expect(env).not_to have_key(described_class::STRIPPED_HEADERS)
       end
+    end
+  end
+
+  describe 'record of what was deleted' do
+    # Session#scheme_evidence and the colonel /system/proxy-headers report
+    # both key on the PRESENCE of these carriers and run below this
+    # middleware; without the record they would report "absent" forever.
+    it 'leaves the names of the deleted carriers in the env, never their values' do
+      env = call_with(
+        'HTTP_HOST' => 'onetime.test',
+        'HTTP_X_FORWARDED_HOST' => 'evil.example.com',
+        'HTTP_FORWARDED' => 'for=192.0.2.60;proto=https;host=evil.example.com',
+      )
+      aggregate_failures do
+        expect(env[described_class::STRIPPED_HEADERS]).to eq(%w[HTTP_X_FORWARDED_HOST HTTP_FORWARDED])
+        expect(env[described_class::STRIPPED_HEADERS]).to be_frozen
+        expect(env.values.grep(/192\.0\.2\.60|evil/)).to be_empty
+      end
+    end
+
+    it 'names only the carrier that was present' do
+      env = call_with('HTTP_HOST' => 'onetime.test', 'HTTP_FORWARDED' => 'proto=https')
+      expect(env[described_class::STRIPPED_HEADERS]).to eq(%w[HTTP_FORWARDED])
     end
   end
 
@@ -107,6 +131,31 @@ RSpec.describe Onetime::Middleware::StripForwardedHost do
       Rack::Request.forwarded_priority = [:x_forwarded]
 
       env['HTTP_X_FORWARDED_PROTO'] = 'https'
+      expect(Rack::Request.new(call_with(env)).scheme).to eq('https')
+    end
+
+    it 'never downgrades a real-TLS origin whose scheme lives only in rack.url_scheme' do
+      # TLS terminated at the origin: the Rack server sets rack.url_scheme and
+      # no HTTPS env var, so nothing outranks the forwarded carrier in
+      # Rack::Request#scheme and the pre-strip read answers http.
+      Rack::Request.forwarded_priority = [:forwarded]
+
+      env['HTTP_FORWARDED']  = 'proto=http;host=evil.example.com'
+      env['rack.url_scheme'] = 'https'
+
+      request = Rack::Request.new(call_with(env))
+      aggregate_failures do
+        expect(request.env['rack.url_scheme']).to eq('https')
+        expect(request).to be_ssl
+      end
+    end
+
+    it 'still upgrades http to https when the Forwarded proxy says so' do
+      Rack::Request.forwarded_priority = [:forwarded]
+
+      env['HTTP_FORWARDED']  = 'proto=https;host=onetime.test'
+      env['rack.url_scheme'] = 'http'
+
       expect(Rack::Request.new(call_with(env)).scheme).to eq('https')
     end
 

@@ -4,6 +4,8 @@
 
 require_relative File.join(Onetime::HOME, 'spec', 'spec_helper')
 require 'colonel/auth_strategies'
+require 'onetime/middleware/strip_forwarded_host'
+require 'onetime/session'
 
 RSpec.describe ColonelAPI::AuthStrategies::SessionAuthStrategy do
   subject(:strategy) { described_class.new }
@@ -43,6 +45,7 @@ RSpec.describe ColonelAPI::AuthStrategies::SessionAuthStrategy do
           client_ip: '203.0.113.0',
           via_trusted_proxy: true,
           detected_host: 'tenant.example.test',
+          stripped_forwarded_headers: [],
         },
         request_headers: {
           'host' => 'origin.example.test',
@@ -55,6 +58,24 @@ RSpec.describe ColonelAPI::AuthStrategies::SessionAuthStrategy do
           'apx-incoming-host' => 'tenant.example.test',
         },
       )
+    end
+
+    it 'reports the carriers StripForwardedHost deleted, by wire name' do
+      # The middleware has already deleted HTTP_FORWARDED / HTTP_X_FORWARDED_HOST
+      # by the time any app runs; only its record of the deletion is left.
+      env['onetime.stripped_forwarded_headers'] = %w[HTTP_X_FORWARDED_HOST HTTP_FORWARDED].freeze
+
+      metadata = strategy.send(:build_metadata, env)
+
+      expect(metadata[:proxy_header_debug][:rack][:stripped_forwarded_headers]).to eq(%w[x-forwarded-host forwarded])
+    end
+
+    it 'reads the stripped-carrier record through the same env key the middleware and Session use' do
+      # Three files name this seam with their own literal so none has to load
+      # the others; a rename in one would leave every suite green while the
+      # diagnostics silently went back to "permanently absent".
+      expect([described_class::STRIPPED_FORWARDED_HEADERS, Onetime::Session::STRIPPED_FORWARDED_HEADERS])
+        .to all(eq(Onetime::Middleware::StripForwardedHost::STRIPPED_HEADERS))
     end
 
     it 'reads detected_host through the configurable result field name' do

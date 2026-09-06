@@ -30,7 +30,12 @@ Changed
   out, so no quoting trick can smuggle a host past the strip. The scheme Rack
   resolved from the header under the pinned forwarding family is carried into
   ``rack.url_scheme`` first, so a depth-mode ``Forwarded``-only proxy keeps
-  its TLS scheme.
+  its TLS scheme. The carry only ever upgrades: a ``Forwarded: proto=http``
+  cannot downgrade a request already established as https (TLS at the
+  origin, or ``site.network.assume_https``). The names of the deleted
+  headers are left in ``env['onetime.stripped_forwarded_headers']`` so the
+  dropped-secure-cookie warning and the colonel ``/system/proxy-headers``
+  report still show whether the edge sent them.
 
 - ``rack-parser`` is declared directly in the Gemfile; it stopped being an
   otto runtime dependency in 2.10.
