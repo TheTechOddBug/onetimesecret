@@ -317,6 +317,11 @@ RSpec.configure do |config|
   # .ip_privacy_security_config, Otto.new), and examples covering depth mode
   # with header Forwarded/Both would otherwise fail or pass by run order.
   # Reset per example, the same way AdminNetworkIsolation's ledger is above.
+  # The reset clears otto's registry AND restores Rack::Request
+  # .forwarded_priority to the value otto captured at load
+  # (otto/security/config.rb, DEFAULT_RACK_FORWARDED_PRIORITY), so examples
+  # that assign the priority directly do not leak `[:forwarded]` into later
+  # spec files either.
   config.after do
     Otto::Security::Config.reset_rack_forwarding_family_for_testing! if defined?(Otto::Security::Config)
   end
