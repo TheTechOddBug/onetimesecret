@@ -54,6 +54,14 @@ module Onetime
     # own; `for=` has already been consumed by otto's IP resolution, which
     # runs first.
     #
+    # This write cannot DOWNGRADE a scheme an upstream middleware upgraded.
+    # `Rack::Request#scheme` answers from `env['HTTPS'] == 'on'` before it
+    # looks at any forwarded carrier, and Onetime::Middleware::AssumeHttps
+    # (mounted far above) sets HTTPS alongside rack.url_scheme. So under
+    # assume_https a client-supplied `Forwarded: proto=http` still reads back
+    # as https here, and the secure-cookie / origin / HSTS consumers keep the
+    # operator's policy. Pinned in the middleware spec.
+    #
     # ## Ordering — AFTER DetectHost AND AdminNetworkIsolation, before
     # ## anything reads request.host
     #

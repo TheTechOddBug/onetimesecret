@@ -110,6 +110,25 @@ RSpec.describe Onetime::Middleware::StripForwardedHost do
       expect(Rack::Request.new(call_with(env)).scheme).to eq('https')
     end
 
+    it 'never downgrades a scheme AssumeHttps upgraded (Forwarded proto=http)' do
+      # AssumeHttps mounts far above this middleware and sets BOTH env['HTTPS']
+      # and rack.url_scheme. Rack::Request#scheme checks HTTPS='on' BEFORE any
+      # forwarded carrier, so the pre-strip read this middleware writes back
+      # resolves to https and the client-supplied proto=http cannot undo the
+      # operator's assume_https policy.
+      Rack::Request.forwarded_priority = [:forwarded]
+
+      env['HTTP_FORWARDED']  = 'proto=http;host=evil.example.com'
+      env['HTTPS']           = 'on'
+      env['rack.url_scheme'] = 'https'
+
+      request = Rack::Request.new(call_with(env))
+      aggregate_failures do
+        expect(request.env['rack.url_scheme']).to eq('https')
+        expect(request).to be_ssl
+      end
+    end
+
     it 'does not upgrade a plain http request that carries only a Forwarded host' do
       Rack::Request.forwarded_priority = [:forwarded]
 

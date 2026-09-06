@@ -299,12 +299,28 @@ module Onetime
 
           # otto 2.10 raises on this combination too, but names its own
           # setters; report it against the keys the operator actually edits.
+          #
+          # `mode` here is the RESOLVED value, so an unrecognized spelling has
+          # already fallen back to 'filter' (see .trusted_proxy_mode). Name the
+          # value the operator actually wrote when it is not the one in force —
+          # otherwise the message tells someone who typed `mode: dept` to "set
+          # mode to 'depth'", which is what they believe they did, and the typo
+          # never appears.
           if mode != 'depth' && !header.casecmp?(DEFAULT_TRUSTED_PROXY_HEADER)
+            configured_mode = OT.conf.dig('site', 'network', 'trusted_proxy', 'mode').to_s.strip
+            mode_note       = if configured_mode.empty? || configured_mode.downcase == mode
+                                "mode=#{mode}"
+                              else
+                                "mode #{configured_mode.inspect} is not a recognized " \
+                                  "value and resolved to #{mode.inspect}"
+                              end
+
             raise ArgumentError,
               "[MiddlewareStack] site.network.trusted_proxy.header #{header.inspect} " \
-              'requires mode=depth: filter mode resolves client IPs from the ' \
-              'X-Forwarded-For family only and never reads RFC 7239 Forwarded. ' \
-              "Set trusted_proxy.mode to 'depth' or remove the header setting."
+              "requires mode=depth (#{mode_note}): filter mode resolves client IPs " \
+              'from the X-Forwarded-For family only and never reads RFC 7239 ' \
+              "Forwarded. Set trusted_proxy.mode to 'depth' or remove the header " \
+              'setting.'
           end
 
           # Read here rather than in the filter branch: depth mode needs it to

@@ -329,6 +329,11 @@ RSpec.describe Onetime::Application::MiddlewareStack do
         expect { config }.to raise_error(ArgumentError, /trusted_proxy\.header.*requires mode=depth/)
       end
 
+      it 'names the misspelled mode the operator wrote, not just the fallback' do
+        stub_conf('enabled' => true, 'mode' => 'dept', 'header' => 'Forwarded')
+        expect { config }.to raise_error(ArgumentError, /"dept" is not a recognized value/)
+      end
+
       it 'rejects Both in filter mode' do
         stub_conf('enabled' => true, 'mode' => 'filter', 'header' => 'Both')
         expect { config }.to raise_error(ArgumentError, /requires mode=depth/)
